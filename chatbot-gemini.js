@@ -34,7 +34,7 @@ async function getWebsiteContent(url) {
     }
 }
 
-function chunkText(text, chunkSize = 500) {
+function chunkText(text, chunkSize = 1000) {
     const chunks = [];
     const words = text.split(/\s+/);
     let currentChunk = [];
@@ -51,31 +51,40 @@ function chunkText(text, chunkSize = 500) {
     return chunks;
 }
 
-async function getEmbedding(text, taskType) {
-    try {
-        const response = await ai.models.embedContent({
-            model: EMBEDDING_MODEL,
-            contents: text,
-            config: {
-                taskType: taskType
+async function getEmbedding(text, taskType, retries = 5, delay = 3000) { // Menambahkan parameter retries dan delay
+    for (let i = 0; i < retries; i++) {
+        try {
+            const response = await ai.models.embedContent({
+                model: EMBEDDING_MODEL,
+                contents: text,
+                config: {
+                    taskType: taskType
+                }
+            });
+
+            const embeddings = response.embeddings?.[0]?.values;
+            if (!embeddings) throw new Error('Embedding tidak tersedia dalam response.');
+
+            return embeddings;
+
+        } catch (error) {
+            console.error(`Gagal mendapatkan embedding dengan model ${EMBEDDING_MODEL} (taskType: ${taskType}):`, error.message);
+            if (error.response && error.response.data) {
+                console.error(`Detail Error: ${JSON.stringify(error.response.data, null, 2)}`);
+            } else {
+                console.error(`Detail Error: ${error.message}`);
             }
-        });
 
-        // Ambil vektor embedding dari indeks pertama
-        const embeddings = response.embeddings?.[0]?.values;
-        if (!embeddings) throw new Error('Embedding tidak tersedia dalam response.');
-
-        return embeddings;
-
-    } catch (error) {
-        console.error(`Gagal mendapatkan embedding dengan model ${EMBEDDING_MODEL} (taskType: ${taskType}):`, error.message);
-        if (error.response && error.response.data) {
-            console.error(`Detail Error: ${JSON.stringify(error.response.data, null, 2)}`);
-        } else {
-            console.error(`Detail Error: ${error.message}`);
+            if (error.response && error.response.status === 429 && i < retries - 1) {
+                console.log(`Menunggu ${delay / 1000} detik sebelum mencoba lagi...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; // Gandakan delay untuk percobaan berikutnya (exponential backoff)
+            } else {
+                return null; // Jika bukan 429 atau sudah mencapai batas retries, keluar
+            }
         }
-        return null;
     }
+    return null; // Jika semua percobaan gagal
 }
 
 function cosineSimilarityCorrected(vecA, vecB) {
@@ -119,6 +128,32 @@ async function trainFromWebsite(url) {
 
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
     console.log(`Training selesai. Data disimpan ke ${DATA_FILE}`);
+}
+
+async function trainFromMarkdown(filePath) {
+    console.log(`Membaca file markdown dari: ${filePath}`);
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const chunks = chunkText(content);
+        console.log(`File markdown dipecah menjadi ${chunks.length} potongan (chunks).`);
+
+        const data = [];
+        for (let i = 0; i < chunks.length; i++) {
+            process.stdout.write(`Membuat embedding untuk chunk ${i + 1}/${chunks.length}...`);
+            const embedding = await getEmbedding(chunks[i], 'RETRIEVAL_DOCUMENT');
+            if (embedding) {
+                data.push({ text: chunks[i], embedding: embedding });
+                process.stdout.write(' Selesai.\n');
+            } else {
+                process.stdout.write(' Gagal.\n');
+            }
+        }
+
+        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+        console.log(`Training selesai. Data disimpan ke ${DATA_FILE}`);
+    } catch (error) {
+        console.error(`Gagal membaca atau memproses file markdown:`, error.message);
+    }
 }
 
 async function queryChatbot(query) {
@@ -170,7 +205,7 @@ async function queryChatbot(query) {
             }
         });
 
-        console.log('\nChatbot:');
+        console.log('\nGenerate Content:');
         console.log(response.text);
     } catch (error) {
         console.error(`Gagal mendapatkan jawaban dari Gemini dengan model ${GENERATIVE_MODEL}:`, error.message);
@@ -186,11 +221,12 @@ async function queryChatbot(query) {
 async function main() {
     console.log('--- AI Chatbot CLI ---');
     console.log('1. Train dari Website (Input URL)');
-    console.log('2. Tanyakan Chatbot (Membutuhkan data training)');
-    console.log('3. Keluar');
+    console.log('2. Train dari File Markdown');
+    console.log('3. Tanyakan Chatbot (Membutuhkan data training)');
+    console.log('4. Keluar');
 
     let choice;
-    while (choice !== '3') {
+    while (choice !== '4') {
         choice = readline.question('Pilih opsi: ');
 
         switch (choice) {
@@ -203,6 +239,14 @@ async function main() {
                 }
                 break;
             case '2':
+                const filePath = readline.question('Masukkan path file markdown untuk training: ');
+                if (filePath) {
+                    await trainFromMarkdown(filePath);
+                } else {
+                    console.log('Path file tidak boleh kosong.');
+                }
+                break;
+            case '3':
                 const query = readline.question('Tanyakan sesuatu kepada chatbot: ');
                 if (query) {
                     await queryChatbot(query);
@@ -210,7 +254,7 @@ async function main() {
                     console.log('Pertanyaan tidak boleh kosong.');
                 }
                 break;
-            case '3':
+            case '4':
                 console.log('Sampai jumpa!');
                 break;
             default:
